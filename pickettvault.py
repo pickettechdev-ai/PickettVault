@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-PickettVault v1.3 — USB project sync for PICKETTECH
+PickettVault v1.4 — USB project sync for PICKETTECH
 ====================================================
 
+v1.4: Remove project; warns when project folders overlap.
 v1.3: Help button in the header.
 v1.2: PICKETTECH branding, dark theme, Help menu (F1).
 v1.1: adds "Mirror" — a full backup copy of the whole vault on a second
@@ -63,7 +64,7 @@ except ImportError:  # allows the sync engine to be imported/tested headless
     tk = None
 
 APP_NAME = "PickettVault"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 MIRROR_DIR = "PICKETVAULT_MIRROR"
 MIRROR_SKIP_TOP = {"$RECYCLE.BIN", "System Volume Information", "_removed"}
 VAULT_LABEL = "PICKETVAULT"
@@ -333,6 +334,39 @@ def mirror_vault(src, dst, progress=None):
     return res
 
 
+def _norm(p):
+    return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+
+def is_inside(child, parent):
+    c, p = _norm(child), _norm(parent)
+    return c == p or c.startswith(p.rstrip(os.sep) + os.sep)
+
+
+def folder_problem(vault, name, folder):
+    """Why this folder is a bad PC folder for project `name`, or None if it's fine."""
+    if os.path.splitdrive(_norm(folder))[1] in ("", os.sep):
+        return "That's the root of a whole drive. Pick the project's own folder instead."
+    if is_inside(folder, vault.root) or is_inside(vault.root, folder):
+        return "That folder is on (or contains) the vault itself. Pick a folder on this PC."
+    for other in vault.projects:
+        if other == name:
+            continue
+        o = vault.pc_dir(other)
+        if not o:
+            continue
+        if _norm(o) == _norm(folder):
+            return f"'{other}' already uses this exact folder."
+        if is_inside(o, folder):
+            return (f"This folder contains '{other}'s folder:\n{o}\n\n"
+                    f"Scanning it would mix {other}'s files into {name}. "
+                    "Pick the project's own folder instead.")
+        if is_inside(folder, o):
+            return (f"This folder is inside '{other}'s folder:\n{o}\n\n"
+                    "Its files would be synced twice.")
+    return None
+
+
 def write_changelog(pc_root, usb_root, name, version, note, files, done):
     header = f"# {name} — Changelog\n\n"
     old = ""
@@ -401,6 +435,26 @@ class Vault:
     def set_mirror(self, path, auto):
         m = self.cfg.setdefault("mirrors", {}).setdefault(COMPUTER, {})
         m.update({"path": path, "auto": auto})
+        self.save()
+
+    def remove_project(self, name, keep_usb_files=True):
+        """Forget a project. The PC folder is never touched. USB files are either
+        left where they are or moved to .pickettvault/removed_projects/."""
+        usb = self.usb_dir(name)
+        if os.path.isdir(usb):
+            if not os.listdir(usb):
+                os.rmdir(usb)
+            elif not keep_usb_files:
+                stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                dest = os.path.join(self.meta, "removed_projects", f"{safe_name(name)}_{stamp}")
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(usb, dest)
+        prefix = safe_name(name) + "__"
+        sdir = os.path.join(self.meta, "state")
+        for f in os.listdir(sdir):
+            if f.startswith(prefix):
+                os.remove(os.path.join(sdir, f))
+        del self.projects[name]
         self.save()
 
     def state_file(self, name):
@@ -707,6 +761,12 @@ Copy PICKETVAULT_MIRROR onto a new stick, rename the stick to PICKETVAULT, and c
 - Unplug it, plug it back in, then click Detect USB.
 - Or use File → Choose vault folder… and pick the drive by hand.
 
+# Files from other projects show up in a scan
+The project's PC folder is set to a parent folder (e.g. D:\\PICKETTECH) instead of its own folder. Select the project, click Set PC folder and pick its own folder. PickettVault now blocks folders that contain another project's folder.
+
+# Removing a project
+Select it and click Remove. Your PC folder is never touched. If the USB still has files for it, you can leave them or move them to .pickettvault\\removed_projects.
+
 # "PC folder isn't set"
 The project was created on a different computer. Select it and click Set PC folder.
 
@@ -860,6 +920,7 @@ class App:
         p = tk.Menu(m, tearoff=0)
         p.add_command(label="Add project…", command=self.add_project)
         p.add_command(label="Set PC folder…", command=self.set_pc)
+        p.add_command(label="Remove project…", command=self.remove_project)
         p.add_separator()
         p.add_command(label="Scan", command=self.scan, accelerator="Ctrl+R")
         p.add_command(label="Sync", command=self.sync, accelerator="Ctrl+S")
@@ -942,6 +1003,7 @@ class App:
         pb2.pack(fill="x", pady=(6, 0))
         self._btn(pb2, "Open PC", self.open_pc, side="left")
         self._btn(pb2, "Open USB", self.open_usb, side="left", padx=6)
+        self._btn(pb2, "Remove", self.remove_project, side="left")
 
         right = ttk.Frame(pane)
         pane.add(right, weight=3)
@@ -1131,6 +1193,10 @@ class App:
         folder = filedialog.askdirectory(title=f"Folder for {name} on this PC")
         if not folder:
             return
+        problem = folder_problem(self.vault, name, folder)
+        if problem:
+            messagebox.showerror(APP_NAME, problem)
+            return
         self.vault.add_project(name, os.path.normpath(folder))
         self.refresh_projects(select=name)
 
@@ -1140,9 +1206,35 @@ class App:
             return
         folder = filedialog.askdirectory(title=f"Folder for {name} on {COMPUTER}")
         if folder:
+            problem = folder_problem(self.vault, name, folder)
+            if problem:
+                messagebox.showerror(APP_NAME, problem)
+                return
             self.vault.set_pc_dir(name, os.path.normpath(folder))
             self.refresh_projects(select=name)
             self.on_select()
+
+    def remove_project(self):
+        name = self.current()
+        if self.busy or not name:
+            return
+        if not messagebox.askyesno(APP_NAME, f"Remove '{name}' from PickettVault?\n\n"
+                                   "Your PC folder is NOT touched."):
+            return
+        usb = self.vault.usb_dir(name)
+        keep = True
+        if os.path.isdir(usb) and os.listdir(usb):
+            keep = not messagebox.askyesno(
+                APP_NAME, f"The USB still has files for '{name}'.\n\n"
+                "Yes = move them to the vault's hidden removed_projects folder\n"
+                "No = leave them on the USB where they are")
+        try:
+            self.vault.remove_project(name, keep_usb_files=keep)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't remove '{name}':\n{e}")
+            return
+        self.refresh_projects()
+        self.on_select()
 
     def _open(self, path):
         if path and os.path.isdir(path) and os.name == "nt":
@@ -1167,6 +1259,11 @@ class App:
         if not pc or not os.path.isdir(pc):
             messagebox.showwarning(APP_NAME, "This project's PC folder isn't set or doesn't "
                                              "exist on this computer. Use 'Set PC folder'.")
+            return
+        problem = folder_problem(self.vault, name, pc)
+        if problem:
+            messagebox.showwarning(APP_NAME, f"{name}'s PC folder needs fixing before scanning:\n\n"
+                                   f"{problem}\n\nUse 'Set PC folder' to choose the right one.")
             return
         usb, state = self.vault.usb_dir(name), self.vault.load_state(name)
         self.prog.set("Scanning…")
