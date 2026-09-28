@@ -5,7 +5,7 @@
 
 PickettVault keeps project folders on your Windows PC in sync with a dedicated USB stick. It keeps a snapshot of every file it replaces and writes a version-numbered changelog each time you sync. It can also mirror the whole stick to a backup drive.
 
-Current version: **v1.3**
+Current version: **v1.4**
 
 ## Features
 
